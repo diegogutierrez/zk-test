@@ -3,6 +3,7 @@ package com.test.zk.watchers;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import org.apache.zookeeper.AsyncCallback.ChildrenCallback;
 import org.apache.zookeeper.AsyncCallback.DataCallback;
 import org.apache.zookeeper.AsyncCallback.StatCallback;
 import org.apache.zookeeper.AsyncCallback.StringCallback;
@@ -16,6 +17,7 @@ import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.ZooKeeper;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.UUID;
 
 public class Master implements Watcher {
@@ -25,6 +27,7 @@ public class Master implements Watcher {
   private ZooKeeper zk;
   private String connectString;
   private boolean isLeader = false;
+  private ChildrenCache workersCache;
 
   private static final String NODE_ID = "Master_" + UUID.randomUUID().toString();
 
@@ -53,10 +56,14 @@ public class Master implements Watcher {
    *
    * @throws Exception
    */
-  public void stopZK() throws Exception { zk.close(); }
+  public void stopZK() throws Exception {
+    logger.info("ZK closed");
+    zk.close();
+  }
 
 
   private DataCallback checkMasterCallback = (rc, path, ctx, data, stat) -> {
+    logger.info("Response from checking master: [{}]", rc);
     switch (Code.get(rc)) {
       case CONNECTIONLOSS:
         checkMaster();
@@ -77,20 +84,25 @@ public class Master implements Watcher {
    * @return True if the current worker is the leader. False otherwise
    */
   public void checkMaster() {
+    logger.info("Checking master");
     zk.getData("/master", false, checkMasterCallback, null);
   }
 
   private StringCallback masterCreateCallback = (rc, path, ctx, name) -> {
+    logger.info("Response of create master: [{}]", rc);
     switch (Code.get(rc)) {
       case CONNECTIONLOSS:
+        logger.info("Connection loss, trying again");
         checkMaster();
         return;
       case OK:
         isLeader = true;
+        logger.info("I'm the leader now");
         //TODO take leadership
         break;
 
       case NODEEXISTS:
+        logger.info("Master already exists");
         isLeader = false;
         masterExists();
         break;
@@ -108,6 +120,7 @@ public class Master implements Watcher {
    * @throws KeeperException
    */
   public void runForMaster() {
+    logger.info("Running for master");
     zk.create("/master", NODE_ID.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL, masterCreateCallback, null);
   }
 
@@ -199,11 +212,59 @@ public class Master implements Watcher {
   }
 
   /**
+   *
+   */
+
+  Watcher workersChangeWatcher = (WatchedEvent e) -> {
+    if (e.getType() == EventType.NodeChildrenChanged) {
+      getWorkers();
+    }
+  };
+
+  ChildrenCallback workersGetChildrenCallback = (rc, path, ctx, children) -> {
+    switch (Code.get(rc)) {
+      case CONNECTIONLOSS:
+        getWorkers();
+        break;
+      case OK:
+        logger.info("Successfully got a list of workers: " + children.size() + " workers");
+        reassignAndSet(children);
+      default:
+        logger.error("getChildren failed", KeeperException.create(Code.get(rc), path));
+    }
+  };
+
+  private void getWorkers() {
+    zk.getChildren("/workers",
+      workersChangeWatcher,
+      workersGetChildrenCallback,
+      null);
+  }
+
+  private void reassignAndSet(List<String> children) {
+    List<String> toProcess;
+    if (workersCache == null) {
+      workersCache = new ChildrenCache(children);
+      toProcess = null;
+    } else {
+      logger.info("Removing and setting");
+      toProcess = workersCache.removedAndSet(children);//removed workers(I think? :) )
+    }
+
+    if (toProcess != null) {
+      for (String worker : toProcess) {
+        //TODO: getAbsentWorkerTasks(worker);
+      }
+    }
+  }
+
+
+  /**
    * Main
    */
   public static void main(String[] args) throws Exception {
-    //String zkConnectString = "127.0.0.1:2181,127.0.0.1:2182,127.0.0.1:2183";
-    Master master = new Master(args[0]);
+    String zkConnectString = "127.0.0.1:2181,127.0.0.1:2182,127.0.0.1:2183";
+    Master master = new Master(zkConnectString);
     try {
       master.startZK();
       master.runForMaster();
